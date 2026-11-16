@@ -1,0 +1,22 @@
+# Your music stays on your computer: saved pieces and their cached engravings
+pieces/
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Logs and scratch
+*.log
+nohup.out
+tmp/
+
+# Dependencies (none today, ignored in case some are added)
+node_modules/
+
+# macOS and editor clutter
+.DS_Store
+.vscode/
+.idea/
+*.swp
