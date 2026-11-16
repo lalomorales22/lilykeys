@@ -11,6 +11,7 @@
 </head>
 <body>
 
+<div id="setupNote" class="setup-note" role="alert" hidden></div>
 <header class="top">
   <input id="pieceName" class="piece-name" value="Untitled" aria-label="Piece name" spellcheck="false">
   <span id="saveState" class="status"></span>
@@ -27,6 +28,25 @@
   <section class="pane chat" aria-label="Compose with Claude">
     <div class="pane-head">
       <h2>Compose with Claude</h2>
+      <select id="ensemble" class="sel small" aria-label="Instruments Claude writes for" title="Which instruments Claude writes for">
+        <option value="auto">Any instruments</option>
+        <option value="piano">Solo piano</option>
+        <option value="orchestra">Full orchestra</option>
+        <option value="film">Film score</option>
+        <option value="strings">String orchestra</option>
+        <option value="quartet">String quartet</option>
+        <option value="chamber">Wind quintet</option>
+        <option value="brass">Brass ensemble</option>
+        <option value="choir">Choir</option>
+        <option value="jazz">Jazz combo</option>
+        <option value="rock">Rock band</option>
+        <option value="pop">Pop band</option>
+        <option value="electronic">Electronic</option>
+        <option value="lofi">Lo-fi hip-hop</option>
+        <option value="latin">Latin</option>
+        <option value="folk">Folk and celtic</option>
+        <option value="world">World</option>
+      </select>
       <select id="model" class="sel small" aria-label="Claude model">
         <option value="">Default model</option>
         <option value="fable">Fable</option>
@@ -126,6 +146,7 @@
   <div id="keys" class="keys"></div>
 </section>
 
+<script src="instruments.js"></script>
 <script src="audio.js"></script>
 <script src="app.js"></script>
 </body>

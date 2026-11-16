@@ -1,5 +1,6 @@
 // LilyKeys — local studio server. No dependencies.
-// Serves the app, engraves LilyPond (SVG + PDF + MIDI), talks to the `claude` CLI, stores pieces.
+// Serves the app, engraves LilyPond (SVG + PDF + MIDI), talks to the `claude` CLI, stores pieces,
+// and keeps a local copy of the sampled orchestra and band instruments.
 const http = require('http');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -12,12 +13,67 @@ const PORT = Number(process.env.PORT) || 4747;
 const ROOT = __dirname;
 const PUB = path.join(ROOT, 'public');
 const PIECES = path.join(ROOT, 'pieces');
+const SOUNDS = path.join(ROOT, 'sounds');
 fs.mkdirSync(PIECES, { recursive: true });
+fs.mkdirSync(SOUNDS, { recursive: true });
+const GM = require('./public/instruments.js');
 
 const firstExisting = (list, fallback) => list.find(p => fs.existsSync(p)) || fallback;
 const LILY = process.env.LILYPOND || firstExisting(['/opt/homebrew/bin/lilypond', '/usr/local/bin/lilypond'], 'lilypond');
 const CLAUDE = process.env.CLAUDE_BIN || firstExisting(
   [path.join(os.homedir(), '.local/bin/claude'), '/opt/homebrew/bin/claude', '/usr/local/bin/claude'], 'claude');
+
+// ---------- Sampled instruments ----------
+// FluidR3 GM (MIT licence), as packaged by github.com/gleitz/midi-js-soundfonts. Each instrument is
+// downloaded once into sounds/<name>.json as {"A0": base64 mp3, ...} and served from there after that.
+const SAMPLE_SOURCE = 'https://gleitz.github.io/midi-js-soundfonts/FluidR3_GM/';
+const ORCHESTRA = [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 52, 53, 56, 57, 58, 59, 60, 61, 68, 69, 70, 71, 72, 73, 8, 9, 13, 14];
+const BAND = [24, 25, 26, 27, 29, 30, 32, 33, 34, 35, 16, 17, 18, 19, 21, 64, 65, 66, 67, 11, 12, 105, 107, 108, 110, 114, 50, 62, 81, 89];
+const fetchingSound = new Map();
+const soundFile = name => path.join(SOUNDS, name + '.json');
+function getSound(name) {
+  if (!GM.SAMPLE.includes(name)) return Promise.reject(new Error('Unknown instrument'));
+  if (fs.existsSync(soundFile(name))) return Promise.resolve(soundFile(name));
+  if (!fetchingSound.has(name)) {
+    fetchingSound.set(name, (async () => {
+      const r = await fetch(SAMPLE_SOURCE + name + '-mp3.js', { signal: AbortSignal.timeout(120000) });
+      if (!r.ok) throw new Error(`Could not download ${name} (HTTP ${r.status})`);
+      const notes = {};
+      for (const m of (await r.text()).matchAll(/"([A-G]b?-?\d)"\s*:\s*"data:audio\/mp3;base64,([A-Za-z0-9+/=]+)"/g)) notes[m[1]] = m[2];
+      if (Object.keys(notes).length < 10) throw new Error(`The ${name} download looks incomplete`);
+      const tmp = soundFile(name) + '.' + process.pid + '.tmp';
+      await fsp.writeFile(tmp, JSON.stringify(notes));
+      await fsp.rename(tmp, soundFile(name));
+      return soundFile(name);
+    })().finally(() => fetchingSound.delete(name)));
+  }
+  return fetchingSound.get(name);
+}
+async function fetchSounds(which) {
+  const progs = which === 'all' ? GM.SAMPLE.map((_, i) => i) : which === 'band' ? BAND : which === 'orchestra' ? ORCHESTRA : [...new Set([...ORCHESTRA, ...BAND])];
+  let done = 0, failed = 0;
+  for (let i = 0; i < progs.length; i += 4) {
+    await Promise.all(progs.slice(i, i + 4).map(p => getSound(GM.SAMPLE[p]).then(() => done++, e => { failed++; console.log('  ' + e.message); })));
+    process.stdout.write(`\r  Instrument sounds: ${done} of ${progs.length} ready${failed ? `, ${failed} failed` : ''}   `);
+  }
+  console.log('');
+  return failed === 0;
+}
+
+// ---------- What is installed ----------
+const status = { lilypond: null, claude: null, claudeSignedIn: null };
+let toolsChecked = null;
+async function checkTools() {
+  const ly = await run(LILY, ['--version'], { timeout: 20000 });
+  status.lilypond = ly.code === 0 ? ((ly.out.match(/LilyPond (\d+\.\d+\.\d+)/) || [])[1] || 'installed') : null;
+  const cv = await run(CLAUDE, ['--version'], { timeout: 20000, env: claudeEnv() });
+  status.claude = cv.code === 0 ? cv.out.trim().split(/\s/)[0] : null;
+  if (status.claude) {
+    const au = await run(CLAUDE, ['auth', 'status'], { timeout: 20000, env: claudeEnv() });
+    try { status.claudeSignedIn = !!JSON.parse(au.out).loggedIn; } catch { status.claudeSignedIn = au.code === 0 ? null : false; }
+  }
+  return status;
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -63,8 +119,9 @@ async function engraveNow(ly) {
     const svgs = await Promise.all(svgFiles.map(f => fsp.readFile(path.join(dir, f), 'utf8')));
     const b64 = async f => (await fsp.readFile(path.join(dir, f))).toString('base64');
     const log = r.err.split('\n').filter(l => l.trim() && !/^(Processing|Parsing|Interpreting|Preprocessing|Finding|Fitting|Drawing|Layout output|MIDI output|Converting|Success|GNU LilyPond|Changing working)/.test(l.trim())).join('\n').replace(/score\.ly:/g, 'line ');
+    const missing = /Could not find/.test(r.err) ? 'LilyPond is not installed on this computer. Double-click setup.command in the LilyKeys folder (or run: brew install lilypond), then restart LilyKeys.' : '';
     return {
-      ok: svgs.length > 0, log, svgs,
+      ok: svgs.length > 0, log: missing || log, svgs,
       midi: midiFile ? await b64(midiFile) : null,
       pdf: files.includes('out.pdf') ? await b64('out.pdf') : null,
     };
@@ -74,12 +131,18 @@ async function engraveNow(ly) {
 }
 
 // ---------- Claude ----------
-const SYSTEM = `You are the composing partner inside LilyKeys, a music studio app running on the user's own computer. It has a playable piano, a LilyPond score editor that engraves and plays back whatever is in it, and a 16-step drum machine. You help the user write original music.
+const LY_NAMES = GM.LY.map(n => `"${n}"`).join(', ');
+const SYSTEM = `You are the composing partner inside LilyKeys, a music studio app running on the user's own computer. It has a playable piano, a LilyPond score editor that engraves and plays back whatever is in it, a drum machine, and sampled instruments for a full orchestra and band. You help the user write original music in any style, from solo piano to full orchestra.
 
 How to answer:
 - When you write or change music, return the COMPLETE LilyPond file in a single \`\`\`lilypond fenced block. The app replaces the editor with it, engraves it and can play it. Never return fragments or diffs.
 - The file must compile with LilyPond 2.26: start with \\version "2.26.0", give it a \\header with a title and tagline = ##f, and put both \\layout { } and \\midi { } inside the \\score so it can be seen and heard. Always set a \\tempo.
-- Piano music goes in a PianoStaff with two staves. Drums written into the score go in a \\new DrumStaff with \\drummode (bd, sn, hh, hho, hc, ss, cb, toml).
+- Piano music goes in a PianoStaff with two staves. Drums written into the score go in a \\new DrumStaff with \\drummode (bd, sn, hh, hho, hc, ss, cb, toml, cymc, cymr, tamb, tri).
+- Every staff plays back with the sound named by its midiInstrument. Give each non-piano staff one, for example \\new Staff \\with { instrumentName = "Violin I" shortInstrumentName = "Vln. I" midiInstrument = "violin" }. A staff without one plays on the piano sound the user chose on the keyboard. Use only these exact midiInstrument names: ${LY_NAMES}.
+- For ensembles, write a proper score: group staves the way a real score does (\\new StaffGroup for woodwinds, brass, strings; \\new ChoirStaff for voices; a PianoStaff or GrandStaff for keyboard or harp), in standard score order from top to bottom: woodwinds, brass, percussion (timpani on its own Staff with midiInstrument "timpani"), keyboards and harp, voices, strings. Write every part at concert pitch with the right clef (alto clef for viola, bass clef for cello, contrabass, bassoon, trombone, tuba and timpani) and do not use \\transposition. Keep each part in its instrument's real range.
+- Orchestrate like a composer: give the melody to one section, harmony and pads to another, a bass line to the low instruments, and pass ideas between sections. Use dynamics (\\p, \\mf, \\f, \\< \\>) in every part, since they set how loudly each instrument plays back. Use rests generously so parts breathe.
+- For any score with more than one instrument, write the midi block as \\midi { \\context { \\Score midiChannelMapping = #'instrument } } so staves that share an instrument share a MIDI channel. Use at most 15 different pitched instruments.
+- Put shared music in variables (violinI = \\relative c'' { ... }) and give every part the same \\time, \\key and number of bars. For long silences in a part use multi-measure rests such as R1*8.
 - Prefer plain, robust LilyPond. Count the beats in every bar. Avoid Scheme and exotic overrides.
 - To set the drum machine, add a \`\`\`beat fenced block holding JSON like {"tempo": 92, "swing": 20, "kit": "808", "tracks": {"kick": "x.......x.x.....", "snare": "....x.......x..."}}. Each character is one sixteenth note: x is a hit, X an accented hit, o a soft ghost note, . is silence. A track is 16, 32, 64 or 128 characters long (1, 2, 4 or 8 bars of 4/4); the longest track sets the beat's length and shorter tracks repeat to fill it, so a 16-character hat can loop under a 64-character kick. Use the extra bars for variation and fills when the user wants a longer or more dynamic beat. Tracks: kick, snare, hat, openhat, clap, tom, rim, cowbell. Kits: "808", "tight", "lofi". Swing is 0 to 60. Tracks you leave out are cleared.
 - Outside those blocks, write two to four plain sentences: what you wrote and one idea for where to take it next. No headings, no bullet lists.
@@ -95,7 +158,7 @@ function claudeEnv() {
 async function askClaude(prompt, model) {
   const args = ['-p', '--system-prompt', SYSTEM, '--tools', '', '--strict-mcp-config', '--no-session-persistence', '--disable-slash-commands'];
   if (model && /^[a-z0-9.-]+$/i.test(model)) args.push('--model', model);
-  const r = await run(CLAUDE, args, { cwd: os.tmpdir(), input: prompt, timeout: 420000, env: claudeEnv() });
+  const r = await run(CLAUDE, args, { cwd: os.tmpdir(), input: prompt, timeout: 600000, env: claudeEnv() });
   if (r.code !== 0 || !r.out.trim()) throw new Error((r.err || r.out || 'Claude did not answer.').trim().slice(0, 600));
   return r.out.trim();
 }
@@ -103,8 +166,29 @@ async function askClaude(prompt, model) {
 const LY_BLOCK = /```(?:lilypond|ly)[^\n]*\n([\s\S]*?)```/i;
 const BEAT_BLOCK = /```beat[^\n]*\n([\s\S]*?)```/i;
 
+// The ensemble menu in the studio. Each entry tells Claude which instruments to write for.
+const ENSEMBLES = {
+  auto: '',
+  piano: 'Write for solo piano (a PianoStaff, no midiInstrument).',
+  orchestra: 'Write for full symphony orchestra: flute, oboe, clarinet, bassoon; french horns, trumpets, trombone, tuba; timpani; harp; violins I and II, violas, cellos, contrabasses. Use cymbals or bass drum in a DrumStaff only if the music calls for them. Make full use of the colours of the orchestra.',
+  strings: 'Write for string orchestra: violins I, violins II, violas, cellos and contrabasses. Use pizzicato strings or tremolo strings for colour where they suit.',
+  quartet: 'Write for string quartet: violin I, violin II, viola and cello.',
+  film: 'Write a cinematic film-score cue: strings, french horns, trumpets and trombones, woodwinds, timpani, harp, choir aahs, and a piano or celesta for colour, with cymbal swells in a DrumStaff where they help. Build in big, clear dynamic arcs.',
+  chamber: 'Write for wind quintet: flute, oboe, clarinet, french horn and bassoon.',
+  brass: 'Write for brass ensemble: trumpets, french horns, trombones and tuba, with timpani if it suits.',
+  choir: 'Write for choir: soprano, alto, tenor and bass in a ChoirStaff, each with midiInstrument "choir aahs" and \\addlyrics words if the user wants words, optionally with organ or piano accompaniment.',
+  jazz: 'Write for a jazz combo: tenor sax or trumpet on the melody, piano comping with jazz voicings, acoustic bass walking, drums in a DrumStaff with ride cymbal (cymr), hi-hat and brushes-style snare. Swing the feel.',
+  rock: 'Write for a rock band: distorted guitar, clean or overdriven rhythm guitar, electric bass (finger), drawbar or rock organ or piano, and drums in a DrumStaff (and a matching ```beat block).',
+  pop: 'Write for a modern pop band: piano or electric piano, synth pad, electric bass, a lead synth or guitar hook, strings for lift in the chorus, and a beat in a ```beat block.',
+  electronic: 'Write electronic music: synth lead, synth pads, synth bass, arpeggiated synth parts, with the groove in a ```beat block.',
+  lofi: 'Write lo-fi hip-hop: electric piano chords with jazzy extensions, a mellow bass, a soft lead (vibraphone, flute or muted guitar), and a dusty swung beat in a ```beat block.',
+  latin: 'Write Latin music: nylon guitar, piano montuno, acoustic bass, trumpet or flute melody, and percussion (cowbell, rim, toms) in a DrumStaff or ```beat block.',
+  folk: 'Write folk / celtic music: fiddle, acoustic guitar (steel), flute or whistle, accordion, and a light bodhran-like pulse.',
+  world: 'Write for a world ensemble chosen to suit the request, from instruments such as sitar, koto, shamisen, kalimba, steel drums, pan flute, shakuhachi, bagpipe and taiko drum.',
+};
+
 const TEXT_BRIEF = {
-  instrumental: 'Write it as an instrumental piece for piano, with no lyrics.',
+  instrumental: 'Write it as an instrumental piece, with no lyrics.',
   lyrics: 'Write it as a song: a singable melody on its own Staff with \\addlyrics words that distil the text\'s key ideas in your own words (for study notes, make the words accurate and easy to remember), over a PianoStaff accompaniment. Make sure every sung note has a syllable.',
 };
 function textPrompt({ text, filename, style, message }) {
@@ -127,9 +211,10 @@ function textPrompt({ text, filename, style, message }) {
   ].join('\n');
 }
 
-async function compose({ message = '', history = [], ly = '', beat = null, sound = '', model = '', mode = '', text = '', filename = '', style = '' }) {
+async function compose({ message = '', history = [], ly = '', beat = null, sound = '', model = '', mode = '', text = '', filename = '', style = '', ensemble = '' }) {
   let prompt;
-  if (mode === 'text') prompt = textPrompt({ text: String(text).slice(0, 400000), filename, style, message });
+  const band = ENSEMBLES[ensemble] ? `\nInstrumentation the user picked: ${ENSEMBLES[ensemble]} If the user asks for a change to an existing score, keep its instruments unless they ask for different ones.` : '';
+  if (mode === 'text') prompt = textPrompt({ text: String(text).slice(0, 400000), filename, style, message }) + band;
   else {
     const convo = history.slice(-8).map(h => `${h.role === 'user' ? 'User' : 'You'}: ${String(h.text).slice(0, 1200)}`).join('\n');
     prompt = [
@@ -137,6 +222,7 @@ async function compose({ message = '', history = [], ly = '', beat = null, sound
       'Drum machine right now: ' + JSON.stringify(beat || {}),
       sound ? 'Keyboard sound selected: ' + sound : '',
       convo ? '\nEarlier in this conversation:\n' + convo : '',
+      band,
       '\nThe user says:\n' + message,
     ].filter(Boolean).join('\n');
   }
@@ -256,6 +342,7 @@ const server = http.createServer(async (req, res) => {
         try { return send(res, 200, await compose(body)); }
         catch (e) { return send(res, 200, { error: e.message }); }
       }
+      if (p === '/api/status' && req.method === 'GET') return send(res, 200, { ...(await (toolsChecked || (toolsChecked = checkTools()))), sounds: fs.readdirSync(SOUNDS).filter(f => f.endsWith('.json')).length });
       if (p === '/api/pieces' && req.method === 'GET') return send(res, 200, { pieces: await listPieces() });
       if (p === '/api/pieces' && req.method === 'POST') {
         const { id, data } = await readJson(req);
@@ -285,6 +372,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 404, { error: 'Not found' });
     }
 
+    const sm = p.match(/^\/sounds\/([a-z0-9_]+)\.json$/);
+    if (sm && req.method === 'GET') {
+      try {
+        const file = await getSound(sm[1]);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=604800', 'X-Content-Type-Options': 'nosniff' });
+        return fs.createReadStream(file).pipe(res);
+      } catch (e) { return send(res, 404, { error: e.message }); }
+    }
+
     const rel = p === '/' ? 'index.html' : p === '/gallery' ? 'gallery.html' : p.slice(1);
     const file = path.normalize(path.join(PUB, rel));
     if (!file.startsWith(PUB + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return send(res, 404, 'Not found', 'text/plain');
@@ -296,11 +392,21 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  const url = `http://localhost:${PORT}`;
-  console.log(`LilyKeys is running at ${url}\nLilyPond: ${LILY}\nClaude:   ${CLAUDE}\nPress Ctrl+C to stop.`);
-  if (process.argv.includes('--open')) spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
-});
+// `node server.js --fetch-sounds [orchestra|band|all]` downloads instrument sounds ahead of time and exits.
+const fetchArg = process.argv.indexOf('--fetch-sounds');
+if (fetchArg !== -1) {
+  const which = process.argv[fetchArg + 1] || 'default';
+  fetchSounds(which).then(ok => process.exit(ok ? 0 : 1));
+} else {
+  server.listen(PORT, '127.0.0.1', async () => {
+    const url = `http://localhost:${PORT}`;
+    console.log(`LilyKeys is running at ${url}\nPress Ctrl+C to stop.`);
+    if (process.argv.includes('--open')) spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
+    await (toolsChecked = checkTools());
+    console.log(`LilyPond: ${status.lilypond ? status.lilypond + '  ' + LILY : 'NOT FOUND. Run setup.command, or: brew install lilypond'}`);
+    console.log(`Claude:   ${status.claude ? status.claude + '  ' + CLAUDE + (status.claudeSignedIn === false ? '  (not signed in: run `claude` once in Terminal)' : '') : 'NOT FOUND. Composing needs Claude Code: run setup.command'}`);
+  });
+}
 server.on('error', e => {
   if (e.code === 'EADDRINUSE') {
     console.log(`LilyKeys is already running at http://localhost:${PORT}`);

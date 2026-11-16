@@ -313,10 +313,19 @@ function showRender(r) {
     // A new or changed tempo in the score takes over the Tempo box; after that the box sets the playing speed.
     const written = Math.round(song.bpm);
     if (written !== scoreBpm) { scoreBpm = written; setTempo(written); }
-    setStatus(`Engraved. ${clock(song.length)} of music, written at ${written} bpm.` + (state.beat.tempo !== written ? ` Playing at ${state.beat.tempo}.` : ''));
+    setStatus(`Engraved. ${clock(song.length)} of music, written at ${written} bpm.` + (state.beat.tempo !== written ? ` Playing at ${state.beat.tempo}.` : '') + partsText(song));
+    Sound.prepare(song);
   }
   dirty = !r.ok;
   return r.ok;
+}
+// "Instruments: violin, viola, cello", for scores that use more than the keyboard sound.
+function partsText(s) {
+  const named = s.parts.filter(([p]) => p > 0).map(([p]) => Sound.instrumentName(p).toLowerCase());
+  if (!named.length) return '';
+  const piano = s.parts.some(([p]) => p === 0) ? ['piano'] : [];
+  const all = [...piano, ...named];
+  return ` ${all.length} instrument${all.length > 1 ? 's' : ''}: ${all.join(', ')}.`;
 }
 let engraving = null;
 function engrave() {
@@ -337,11 +346,23 @@ function stopScore() {
   $('btnPlay').textContent = 'Play score';
   if (beatStartedByScore) { beat.stop(); beatStartedByScore = false; }
 }
+let starting = null;
 $('btnPlay').onclick = async () => {
   if (Sound.isPlaying) return stopScore();
-  if (dirty || !song) { const ok = await engrave(); if (!ok) return; }
-  if (!song || !song.notes.length) return;
+  if (starting) { starting.cancelled = true; starting = null; $('btnPlay').textContent = 'Play score'; return; }
+  const run = starting = {};
   $('btnPlay').textContent = 'Stop';
+  if (dirty || !song) { const ok = await engrave(); if (!ok || run.cancelled) { if (!run.cancelled) { starting = null; $('btnPlay').textContent = 'Play score'; } return; } }
+  if (!song || !song.notes.length) { starting = null; $('btnPlay').textContent = 'Play score'; return; }
+  if (song.parts.some(([p]) => p > 0)) {
+    const before = $('status').textContent;
+    const slow = setTimeout(() => setStatus('Getting the instrument sounds ready… The first time takes a moment.'), 300);
+    const ready = await Sound.prepare(song);
+    clearTimeout(slow);
+    if (run.cancelled) return;
+    setStatus(ready ? before : 'Some instrument sounds could not be downloaded, so synths stand in for them.', !ready);
+  }
+  starting = null;
   const t0 = Sound.playScore(song, { onKey: (m, on) => mark(m, 'sung', on), onEnd: stopScore, rate: state.beat.tempo / song.bpm });
   if ($('withBeat').checked) { beat.start(t0); beatStartedByScore = true; }
 };
@@ -473,10 +494,22 @@ $('beatFold').onclick = e => {
 };
 
 // ---------- Sound controls ----------
-Sound.SOUNDS.forEach(([k, label]) => $('sound').add(new Option(label, k)));
+(function soundMenu() {
+  const groups = {};
+  Sound.SOUNDS.forEach(([k, label, group]) => {
+    if (!groups[group]) { groups[group] = document.createElement('optgroup'); groups[group].label = group; $('sound').appendChild(groups[group]); }
+    groups[group].appendChild(new Option(label, k));
+  });
+})();
 Object.entries(Sound.KITS).forEach(([k, v]) => $('kit').add(new Option(v.label, k)));
 Object.keys(GROOVES).forEach(n => $('groove').add(new Option(n, n)));
-$('sound').onchange = e => { state.sound = e.target.value; Sound.setSound(state.sound); autosave(); e.target.blur(); };
+$('sound').onchange = e => {
+  state.sound = e.target.value; Sound.setSound(state.sound); autosave(); e.target.blur();
+  if (state.sound.startsWith('gm:')) {
+    setStatus('Loading the ' + e.target.selectedOptions[0].text.toLowerCase() + ' sound…');
+    Sound.warmInstrument(+state.sound.slice(3)).then(ok => setStatus(ok ? e.target.selectedOptions[0].text + ' is ready.' : 'That instrument could not be downloaded, so a synth stands in for it. Check the internet connection.', !ok));
+  }
+};
 $('volume').oninput = e => Sound.setVolume(e.target.value / 100);
 $('sustain').onchange = e => Sound.setSustain(e.target.checked);
 $('octDown').onclick = () => shiftOctave(-1);
@@ -558,6 +591,7 @@ $('tabDesk').onclick = () => showTab(true);
 const history = [];
 const IDEAS = [
   'Write a rainy-day waltz in A minor, 16 bars, with a simple left hand.',
+  'Write a two-minute cinematic orchestral cue in D minor that starts with quiet strings and builds to full brass, timpani and choir.',
   'Keep my melody but give the left hand a walking bass line.',
   'Make a 4-bar boom-bap beat around 88 bpm with ghost notes and a fill in the last bar.',
   'Explain what each part of this LilyPond file does.',
@@ -590,7 +624,7 @@ async function sendToClaude(message, source) {
   let r;
   try {
     r = await api('/api/claude', {
-      message, history, ly: ed.value, beat: beatForExport(), sound: $('sound').selectedOptions[0].text, model: $('model').value,
+      message, history, ly: ed.value, beat: beatForExport(), sound: $('sound').selectedOptions[0].text, model: $('model').value, ensemble: $('ensemble').value,
       ...(source ? { mode: 'text', text: source.text, filename: source.filename, style: $('textStyle').value } : {}),
     });
   } catch { r = { error: 'The LilyKeys server is not answering. Start it again with start.command.' }; }
@@ -682,6 +716,8 @@ $('btnNew').onclick = async () => {
 };
 $('toGallery').onclick = async e => { e.preventDefault(); await saveNow(); location.href = '/gallery'; };
 $('withBeat').addEventListener('change', autosave);
+try { const en = localStorage.getItem('lilykeys-ensemble'); if (en && $('ensemble').querySelector(`option[value="${en}"]`)) $('ensemble').value = en; } catch { /* storage unavailable */ }
+$('ensemble').onchange = e => { try { localStorage.setItem('lilykeys-ensemble', e.target.value); } catch { /* storage unavailable */ } };
 $('pieceName').addEventListener('input', autosave);
 
 // ---------- Start ----------
@@ -703,5 +739,15 @@ const wanted = new URLSearchParams(location.search).get('piece');
   engrave();
 })();
 Sound.setVolume(0.8); Sound.setKit(state.beat.kit);
+// Tell the user plainly if something LilyKeys needs is missing on this computer.
+api('/api/status').then(s => {
+  const say = [];
+  if (!s.lilypond) say.push('LilyPond is not installed, so scores cannot be engraved or played.');
+  if (!s.claude) say.push('Claude Code is not installed, so composing with Claude will not work.');
+  else if (s.claudeSignedIn === false) say.push('Claude Code is not signed in. Open Terminal, run <code>claude</code> once and sign in.');
+  if (!say.length) return;
+  $('setupNote').innerHTML = say.join(' ') + ' To fix it, double-click <code>setup.command</code> in the LilyKeys folder, then restart LilyKeys.';
+  $('setupNote').hidden = false;
+}).catch(() => {});
 showIdeas();
 Sound.loadPiano().then(ok => { if (!ok) { $('sound').value = 'epiano'; state.sound = 'epiano'; Sound.setSound('epiano'); } });

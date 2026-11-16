@@ -1,4 +1,5 @@
-// LilyKeys sound engine: sampled grand, synth voices, drum synth, MIDI file reader, score player.
+// LilyKeys sound engine: sampled grand, sampled General MIDI instruments (the orchestra and band),
+// synth voices, drum synth, MIDI file reader, score player. Needs instruments.js loaded first.
 const Sound = (() => {
   const AC = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
   const master = AC.createGain();
@@ -122,7 +123,19 @@ const Sound = (() => {
     chip: { label: '8-bit', vol: 0.12, a: 0.002, d: 0.2, s: 0.8, r: 0.04, oscs: [{ type: 'square' }] },
   };
 
-  function synthVoice(p, m, vel, t) {
+  // Synth stand-ins for each instrument family, used until (or unless) the sampled instrument is ready.
+  const FALLBACK = {
+    piano: PRESETS.epiano, mallet: PRESETS.bells, organ: PRESETS.organ, pluck: PRESETS.pluck, bass: PRESETS.bass,
+    bowed: { vol: 0.13, a: 0.12, d: 0.6, s: 0.9, r: 0.35, oscs: [{ type: 'sawtooth', detune: -7 }, { type: 'sawtooth', detune: 7 }], filter: { from: 2600, q: 0.6 } },
+    brass: { vol: 0.16, a: 0.04, d: 0.5, s: 0.8, r: 0.15, oscs: [{ type: 'sawtooth' }, { type: 'sawtooth', detune: 4, gain: 0.6 }], filter: { from: 900, to: 2400, decay: 0.25, q: 1.2 } },
+    reed: { vol: 0.16, a: 0.03, d: 0.4, s: 0.85, r: 0.1, oscs: [{ type: 'square' }, { type: 'sine', ratio: 2, gain: 0.2 }], filter: { from: 2200, q: 1 } },
+    flute: { vol: 0.3, a: 0.06, d: 0.4, s: 0.85, r: 0.12, oscs: [{ type: 'sine' }, { type: 'triangle', ratio: 2, gain: 0.12 }] },
+    choir: { vol: 0.16, a: 0.25, d: 0.8, s: 0.85, r: 0.5, oscs: [{ type: 'triangle', detune: -8 }, { type: 'triangle', detune: 8 }, { type: 'sawtooth', gain: 0.25 }], filter: { from: 1300, q: 2 } },
+    timpani: { vol: 0.6, a: 0.003, d: 1.6, s: 0, r: 0.8, oscs: [{ type: 'sine' }, { type: 'sine', ratio: 1.5, gain: 0.35 }, { type: 'sine', ratio: 2, gain: 0.2 }], filter: { from: 1400, to: 300, decay: 0.4 } },
+    lead: PRESETS.lead, pad: PRESETS.pad,
+  };
+
+  function synthVoice(p, m, vel, t, out = instBus) {
     const f = 440 * Math.pow(2, (m - 69) / 12), amp = AC.createGain(), peak = p.vol * (0.3 + 0.7 * vel);
     let dest = amp;
     if (p.filter) {
@@ -147,7 +160,7 @@ const Sound = (() => {
     amp.gain.setValueAtTime(0, t);
     amp.gain.linearRampToValueAtTime(peak, t + p.a);
     amp.gain.setTargetAtTime(peak * p.s, t + p.a, p.d / 3);
-    amp.connect(instBus);
+    amp.connect(out);
     return {
       stop(tr, fast) {
         tr = Math.max(tr, t + p.a + 0.005);
@@ -158,9 +171,85 @@ const Sound = (() => {
     };
   }
 
-  const SOUNDS = [['grand', 'Grand piano'], ...Object.entries(PRESETS).map(([k, v]) => [k, v.label])];
+  // ----- Sampled General MIDI instruments -----
+  // The server keeps a copy of each instrument in sounds/ and hands it over as {"C4": base64 mp3, ...}.
+  // Notes are decoded the first time they are needed; until then the family's synth stands in.
+  const banks = {};
+  const NOTE_PC = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+  const noteNumber = n => { const m = /^([A-G])(b?)(-?\d)$/.exec(n); return m ? 12 * (+m[3] + 1) + NOTE_PC[m[1]] - (m[2] ? 1 : 0) : null; };
+  function loadInstrument(prog) {
+    if (!(prog >= 0 && prog < 128)) return Promise.resolve(false);
+    if (banks[prog]) return banks[prog].ready;
+    const bank = banks[prog] = { raw: {}, buf: {}, pending: {} };
+    bank.ready = fetch('sounds/' + GM.SAMPLE[prog] + '.json').then(r => r.ok ? r.json() : null).then(j => {
+      if (!j) return false;
+      for (const [name, b64] of Object.entries(j)) { const m = noteNumber(name); if (m != null) bank.raw[m] = b64; }
+      return Object.keys(bank.raw).length > 0;
+    }).catch(() => false);
+    return bank.ready;
+  }
+  const nearest = (obj, m) => { let best = null; for (const k in obj) if (best == null || Math.abs(k - m) < Math.abs(best - m)) best = +k; return best; };
+  function decodeNote(prog, m) {
+    const bank = banks[prog]; if (!bank) return Promise.resolve();
+    const s = bank.raw[m] ? m : nearest(bank.raw, m);
+    if (s == null || bank.buf[s]) return Promise.resolve();
+    if (!bank.pending[s]) {
+      const bin = atob(bank.raw[s]), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      bank.pending[s] = AC.decodeAudioData(bytes.buffer).then(b => { bank.buf[s] = b; }).catch(() => {});
+    }
+    return bank.pending[s];
+  }
+  async function warmInstrument(prog, notes) {
+    if (!(await loadInstrument(prog))) return false;
+    const list = notes || Object.keys(banks[prog].raw).map(Number);
+    await Promise.all(list.map(m => decodeNote(prog, m)));
+    return true;
+  }
+  const panners = {};
+  function seatFor(prog, pan) {
+    const key = prog + ':' + (pan ?? 'seat');
+    if (!panners[key]) {
+      const p = AC.createStereoPanner ? AC.createStereoPanner() : AC.createGain();
+      if (p.pan) p.pan.value = pan ?? GM.seat(prog);
+      p.connect(instBus); panners[key] = p;
+    }
+    return panners[key];
+  }
+  function gmVoice(prog, m, vel, t, pan) {
+    const fam = GM.family(prog), out = seatFor(prog, pan), bank = banks[prog];
+    const s = bank && nearest(bank.buf, m);
+    if (s == null || Math.abs(s - m) > 6) {
+      if (bank) decodeNote(prog, m);
+      return synthVoice(FALLBACK[fam.fallback] || PRESETS.epiano, m, vel, t, out);
+    }
+    const buf = bank.buf[s], src = AC.createBufferSource(), g = AC.createGain(), peak = 0.25 + vel * vel * 1.1;
+    src.buffer = buf; src.playbackRate.value = Math.pow(2, (m - s) / 12);
+    // Held notes on bowed, blown and sung instruments loop the steady middle of the recording.
+    if (fam.sustain && buf.duration > 0.8) { src.loop = true; src.loopStart = buf.duration * 0.4; src.loopEnd = buf.duration * 0.85; }
+    const attack = fam.sustain ? 0.02 : 0.003;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(peak, t + attack);
+    src.connect(g); g.connect(out); src.start(t);
+    return {
+      stop(tr, fast) {
+        tr = Math.max(tr, t + attack + 0.01);
+        const tc = fast ? 0.02 : fam.sustain ? 0.09 : 0.18;
+        g.gain.cancelScheduledValues(tr); g.gain.setTargetAtTime(0, tr, tc);
+        try { src.stop(tr + tc * 8); } catch { /* already stopped */ }
+      },
+    };
+  }
+
+  // Sounds for the keyboard: built-in keys and synths, then sampled instruments ('gm:<program>').
+  const SOUNDS = [['grand', 'Grand piano', 'Keys and synths'], ...Object.entries(PRESETS).map(([k, v]) => [k, v.label, 'Keys and synths']),
+    ...GM.KEYBOARD.flatMap(([group, progs]) => progs.map(p => ['gm:' + p, GM.LABEL[p], group]))];
   let current = 'grand';
-  const voice = (m, vel, t) => current === 'grand' ? pianoVoice(m, vel, t) : synthVoice(PRESETS[current], m, vel, t);
+  const voice = (m, vel, t) => current === 'grand' ? pianoVoice(m, vel, t)
+    : current.startsWith('gm:') ? gmVoice(+current.slice(3), m, vel, t)
+    : synthVoice(PRESETS[current] || PRESETS.epiano, m, vel, t);
+  // In a score, a staff with its own midiInstrument plays that instrument; staves without one
+  // (or marked as a grand piano) play whatever sound the keyboard is set to.
+  const scoreVoice = n => n.prog > 0 ? gmVoice(n.prog, n.note, 0.25 + n.vel * 0.7, n.when, n.pan) : voice(n.note, 0.25 + n.vel * 0.7, n.when);
 
   // ----- Live playing -----
   const live = new Map(), pedalHeld = new Set();
@@ -234,6 +323,20 @@ const Sound = (() => {
         toneHit(t, { type: 'triangle', from: 820 * T, decay: 0.03, gain: 0.45 * v });
         noiseHit(t, { type: 'bandpass', freq: 2600 * T, q: 3, decay: 0.03, gain: 0.35 * v });
         break;
+      case 'crash':
+        noiseHit(t, { type: 'highpass', freq: 4200 * T, q: 0.5, decay: 1.6, gain: 0.32 * v });
+        noiseHit(t, { type: 'bandpass', freq: 6800 * T, q: 0.8, decay: 0.9, gain: 0.18 * v });
+        break;
+      case 'ride':
+        noiseHit(t, { type: 'highpass', freq: 7000 * T, decay: 0.45, gain: 0.16 * v });
+        toneHit(t, { type: 'triangle', from: 3200 * T, decay: 0.5, gain: 0.05 * v });
+        break;
+      case 'triangle':
+        toneHit(t, { from: 5100 * T, decay: 1.2, gain: 0.12 * v }); toneHit(t, { from: 7650 * T, decay: 0.8, gain: 0.05 * v });
+        break;
+      case 'tamb':
+        [0, 0.012].forEach(d => noiseHit(t + d, { type: 'bandpass', freq: 9000 * T, q: 1.5, decay: 0.12, gain: 0.25 * v }));
+        break;
       case 'cowbell': {
         const bp = { type: 'square', decay: 0.28, gain: 0.16 * v };
         toneHit(t, { ...bp, from: 545 * T }); toneHit(t, { ...bp, from: 812 * T });
@@ -241,7 +344,7 @@ const Sound = (() => {
       }
     }
   }
-  const GM_DRUM = { 35: 'kick', 36: 'kick', 37: 'rim', 38: 'snare', 40: 'snare', 39: 'clap', 42: 'hat', 44: 'hat', 46: 'openhat', 49: 'openhat', 51: 'hat', 52: 'openhat', 53: 'hat', 55: 'openhat', 57: 'openhat', 59: 'hat', 41: 'tom', 43: 'tom', 45: 'tom', 47: 'tom', 48: 'tom', 50: 'tom', 56: 'cowbell' };
+  const GM_DRUM = { 35: 'kick', 36: 'kick', 37: 'rim', 38: 'snare', 40: 'snare', 39: 'clap', 42: 'hat', 44: 'hat', 46: 'openhat', 49: 'crash', 51: 'ride', 52: 'crash', 53: 'ride', 54: 'tamb', 55: 'crash', 57: 'crash', 59: 'ride', 41: 'tom', 43: 'tom', 45: 'tom', 47: 'tom', 48: 'tom', 50: 'tom', 56: 'cowbell', 75: 'rim', 76: 'rim', 77: 'rim', 80: 'triangle', 81: 'triangle' };
 
   // ----- Standard MIDI file reader -----
   function parseMidi(buffer) {
@@ -253,7 +356,7 @@ const Sound = (() => {
     const varlen = () => { let v = 0, b; do { b = u8(); v = (v << 7) | (b & 0x7f); } while (b & 0x80); return v; };
     if (tag() !== 'MThd') throw new Error('Not a MIDI file');
     const hlen = u32(); u16(); const ntr = u16(), div = u16(); p += hlen - 6;
-    const evs = [];
+    const evs = [], names = {};
     for (let tr = 0; tr < ntr && p < d.byteLength; tr++) {
       if (tag() !== 'MTrk') break;
       const end = u32() + p; let tick = 0, status = 0;
@@ -262,7 +365,9 @@ const Sound = (() => {
         let b = u8();
         if (b === 0xff) {
           const type = u8(), len = varlen();
-          if (type === 0x51) evs.push({ tick, kind: 0, us: (u8() << 16) | (u8() << 8) | u8() }); else p += len;
+          if (type === 0x51) evs.push({ tick, kind: 0, us: (u8() << 16) | (u8() << 8) | u8() });
+          else if (type === 0x04 || type === 0x03) { let s = ''; for (let i = 0; i < len; i++) s += String.fromCharCode(u8()); names[tr] = s; }
+          else p += len;
         } else if (b === 0xf0 || b === 0xf7) { p += varlen(); }
         else {
           if (b & 0x80) status = b; else p--;
@@ -270,25 +375,36 @@ const Sound = (() => {
           if (hi === 0x90 || hi === 0x80) {
             const note = u8(), vel = u8();
             evs.push({ tick, kind: hi === 0x90 && vel > 0 ? 2 : 1, ch, note, vel, tr });
-          } else p += (hi === 0xc0 || hi === 0xd0) ? 1 : 2;
+          } else if (hi === 0xc0) evs.push({ tick, kind: 0, ch, tr, prog: u8() });
+          else if (hi === 0xb0) { const cc = u8(), val = u8(); if (cc === 10) evs.push({ tick, kind: 0, ch, tr, pan: (val - 64) / 64 }); }
+          else p += hi === 0xd0 ? 1 : 2;
         }
       }
       p = end;
     }
     evs.sort((a, b) => a.tick - b.tick || a.kind - b.kind);
     let us = 500000, lastTick = 0, time = 0, bpm = null;
-    const open = new Map(), notes = [];
+    const open = new Map(), notes = [], prog = {}, pan = {}, parts = new Map();
     for (const e of evs) {
       time += (e.tick - lastTick) * us / div / 1e6; lastTick = e.tick;
-      if (e.kind === 0) { us = e.us; if (bpm == null) bpm = 6e7 / us; continue; }
+      if (e.kind === 0) {
+        if (e.us) { us = e.us; if (bpm == null) bpm = 6e7 / us; }
+        // Kept per track as well as per channel: LilyPond writes one track per staff, and when a big
+        // score runs out of channels two staves can share one, each with its own instrument.
+        else if (e.prog != null) prog[e.ch] = prog[e.tr + ':' + e.ch] = e.prog;
+        else if (e.pan != null) pan[e.ch] = pan[e.tr + ':' + e.ch] = e.pan;
+        continue;
+      }
       const key = e.tr + ':' + e.ch + ':' + e.note;
       if (e.kind === 2) {
-        const n = { t: time, dur: 0.25, ch: e.ch, note: e.note, vel: e.vel / 127 };
+        const n = { t: time, dur: 0.25, ch: e.ch, note: e.note, vel: e.vel / 127, prog: e.ch === 9 ? -1 : (prog[e.tr + ':' + e.ch] ?? prog[e.ch] ?? 0), pan: pan[e.tr + ':' + e.ch] ?? pan[e.ch] };
+        if (e.ch !== 9 && !parts.has(n.prog)) parts.set(n.prog, names[e.tr] || '');
         notes.push(n); open.set(key, n);
       } else if (open.has(key)) { const n = open.get(key); n.dur = Math.max(0.03, time - n.t); open.delete(key); }
     }
     notes.sort((a, b) => a.t - b.t);
-    return { notes, bpm: bpm || 120, length: notes.reduce((mx, n) => Math.max(mx, n.t + n.dur), 0) };
+    // parts: the instruments that play, as [program, name]. Program 0 plays on the keyboard's sound.
+    return { notes, bpm: bpm || 120, length: notes.reduce((mx, n) => Math.max(mx, n.t + n.dur), 0), parts: [...parts] };
   }
 
   // ----- Score player -----
@@ -304,7 +420,7 @@ const Sound = (() => {
       while (st.i < song.notes.length && at(song.notes[st.i].t) < AC.currentTime + 0.25) {
         const n = song.notes[st.i++], when = at(n.t), dur = n.dur / st.rate;
         if (n.ch === 9) { const dn = GM_DRUM[n.note]; if (dn) drum(dn, when, 0.4 + n.vel * 0.6); continue; }
-        const v = voice(n.note, 0.25 + n.vel * 0.7, when);
+        const v = scoreVoice({ ...n, when });
         v.stop(when + dur); st.voices.add(v);
         later(() => onKey && onKey(n.note, true), when);
         later(() => { st.voices.delete(v); onKey && onKey(n.note, false); }, when + Math.max(0.06, dur - 0.02));
@@ -327,12 +443,22 @@ const Sound = (() => {
     playing = null;
   }
 
+  // Get every sampled instrument in a song ready (fetched and decoded) before it plays.
+  async function prepare(song) {
+    const want = new Map();
+    for (const n of song.notes) if (n.prog > 0) { if (!want.has(n.prog)) want.set(n.prog, new Set()); want.get(n.prog).add(n.note); }
+    const ok = await Promise.all([...want].map(([p, set]) => warmInstrument(p, [...set])));
+    return ok.every(Boolean);
+  }
+  const instrumentName = p => GM.LABEL[p] || 'Instrument ' + p;
+
   return {
+    prepare, instrumentName, warmInstrument,
     AC, SOUNDS, KITS, loadPiano, noteOn, noteOff, setSustain, drum, setKit, parseMidi, playScore, stopScore, setScoreRate,
     get now() { return AC.currentTime; },
     get isPlaying() { return !!playing; },
     get scorePos() { return playing ? Math.max(0, playing.anchorS + (AC.currentTime - playing.anchorT) * playing.rate) : 0; },
-    setSound(k) { current = k; },
+    setSound(k) { current = SOUNDS.some(([s]) => s === k) ? k : 'grand'; if (current.startsWith('gm:')) warmInstrument(+current.slice(3)); },
     setVolume(v) { master.gain.value = v; },
     setDesk,
   };

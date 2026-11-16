@@ -111,6 +111,11 @@ async function open(id) {
   for (const [k, v] of Object.entries(desk)) if (k !== 'echoTime' && typeof v === 'number') Sound.setDesk(k, v);
   Sound.setDesk('echoTime', (+desk.echoTime || 0.75) * 60 / tempo);
   $('gBeat').checked = !!piece.withBeat && beat.any; $('gBeat').disabled = !beat.any;
+  if (song.parts.some(([p]) => p > 0)) {
+    $('nowName').textContent = 'Getting the instruments ready…';
+    await Sound.prepare(song);
+    if (!cur || cur.song !== song) return;
+  }
   $('nowName').textContent = piece.name;
   pausedAt = 0; sizeRoll(); play(0);
 }

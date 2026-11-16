@@ -20,3 +20,6 @@ node_modules/
 .vscode/
 .idea/
 *.swp
+
+# Downloaded instrument sounds (fetched by setup.command or on first use)
+sounds/
